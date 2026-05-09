@@ -176,19 +176,6 @@ On **FFT peak** (predictive): after every 256-sample FFT window, if the maximum 
 * This is where i stored stuff inside the qnx os
 ---
 
-## Build
-
-```bash
-# QNX cross-compilation from a QNX SDP 7.x host
-aarch64-unknown-nto-qnx7.1.0-gcc sensor_monitor.c \
-    -o sensor_monitor \
-    -lm -lsocket \
-    -O2 -Wall -Wextra
-
-# Transfer to RPi5
-scp sensor_monitor root@<rpi5-ip>:/tmp/
-```
-
 Required QNX libraries: `libm`, `libsocket`. No third-party dependencies. The `llama-cli` binary must be compiled separately from the llama.cpp repo targeting `aarch64-unknown-nto-qnx7.1.0`.
 
 ---
