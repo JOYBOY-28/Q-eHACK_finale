@@ -42,7 +42,7 @@ Each core domain is hard-isolated using `_NTO_TCTL_RUNMASK` **and** `_NTO_TCTL_R
 * the bin contains cross compailed llama-cli for qnx sdp 8.0. Download the model from hugface.
 
 
-* 
+ 
 | Property | Value |
 |----------|-------|
 | Model name | TinyLLaMA 1.1B Chat v1.0 |
