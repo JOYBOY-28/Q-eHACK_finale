@@ -31,7 +31,8 @@ Each core domain is hard-isolated using `_NTO_TCTL_RUNMASK` **and** `_NTO_TCTL_R
 | RTOS | QNX Neutrino 7.x |
 | Sensor nodes | 3 nodes, each with 2 temperature sensors + 3-axis accelerometer |
 | Transport | UDP (ports 8080, 8081, 8082) |
-| Motor control | GPIO via direct MMIO (BCM17, BCM18, BCM27) — active-low reset pulse |
+| Motor control | GPIO via `rpi_gpio` resource manager (`/dev/gpio/N`) — BCM17, BCM18, BCM27 — active-low reset pulse |
+| GPIO driver | `rpi_gpio` (`/system/bin/rpi_gpio`) — QNX BSP resource manager for RPi 3/4/5 |
 
 ---
 
@@ -125,9 +126,17 @@ Each `motor_ctrl_thread` owns a `CLOCK_MONOTONIC` timer that fires `PULSE_WATCHD
 
 The listener thread (Core 0) updates the AI snapshot using `pthread_mutex_trylock`. If the AI manager holds the lock, the listener **silently skips** that update cycle and continues processing sensor data. The RT path never blocks on the AI side under any circumstance.
 
-### 5. GPIO Reset — nanospin, Not delay
+### 5. GPIO Reset — rpi_gpio Resource Manager
 
-`motor_gpio_reset()` uses `nanospin_ns(50000000)` (50 ms busy-wait) rather than `delay()`. On a dedicated Core 1 with nothing else scheduled, this gives deterministic reset pulse width. `delay()` would yield the thread and introduce scheduler jitter into the hold time.
+`motor_gpio_reset()` uses the QNX `rpi_gpio` resource manager via `/dev/gpio/N` file descriptors. The confirmed command interface (from `strings /system/bin/rpi_gpio`) is:
+
+| Write string | Effect |
+|---|---|
+| `"out"` | Configure pin as output (no newline — echo -n semantics) |
+| `"on"` | Drive HIGH — motor released from reset |
+| `"off"` | Drive LOW — motor asserted into reset |
+
+`"1"`/`"0"` and newline-terminated strings are silently discarded by `rpi_gpio`. All three motor pins (BCM17, BCM18, BCM27) are driven `"out"` then `"on"` at startup via `gpio_init_all_high()` before any thread is created, ensuring motors are never accidentally held in reset at boot. The reset pulse sequence is `"off"` → `delay(50)` → `"on"` — 50 ms active-low pulse per motor reset event. `delay()` is used instead of `nanospin_ns` because the fd write to the resource manager is atomic, so yielding during the hold adds no correctness risk and avoids burning Core 1 solid for 50 ms.
 
 ### 6. Cross-Core IPC Latency
 
@@ -168,13 +177,30 @@ On **FFT peak** (predictive): after every 256-sample FFT window, if the maximum 
 ## File Structure
 
 ```
-/              
+/
+├── sensor_monitor.c                    # Main source — all threads, IPC, AI, GPIO                          # This file
 └── /tmp/ai_engine/
-    ├── llama-cli             # llama.cpp CLI binary (compiled for aarch64)
+    ├── llama-cli                       # llama.cpp CLI binary (aarch64-qnx)
     └── tinyllama-1.1b-chat-v1.0-q4_k_m.gguf   # Model file (~670 MB)
-```
-* This is where i stored stuff inside the qnx os
+
+/system/bin/rpi_gpio                    # QNX BSP GPIO resource manager (pre-installed)
+/dev/gpio/                              # Pin devices exposed by rpi_gpio (0–27 + msg)
+* this is in qnx sdp```
+
 ---
+
+## Build
+
+```bash
+# QNX cross-compilation from a QNX SDP 7.x host
+aarch64-unknown-nto-qnx7.1.0-gcc sensor_monitor.c \
+    -o sensor_monitor \
+    -lm -lsocket \
+    -O2 -Wall -Wextra
+
+# Transfer to RPi5
+scp sensor_monitor root@<rpi5-ip>:/tmp/
+```
 
 Required QNX libraries: `libm`, `libsocket`. No third-party dependencies. The `llama-cli` binary must be compiled separately from the llama.cpp repo targeting `aarch64-unknown-nto-qnx7.1.0`.
 
@@ -182,7 +208,9 @@ Required QNX libraries: `libm`, `libsocket`. No third-party dependencies. The `l
 
 ## Runtime Requirements
 
-- Process must run as **root** (or with `io` capability) for `_NTO_TCTL_IO_PRIV` and `mmap_device_io`
+- Process must run as **root** or be a member of the **`gpio` group** — `ls -la /dev/gpio/` shows `group=gpio`, `mode=rw-rw----`, so non-root processes in the gpio group can open pin fds without elevated privilege
+- `_NTO_TCTL_IO_PRIV` is **not required** — GPIO is accessed through the `rpi_gpio` resource manager, not direct MMIO
+- `rpi_gpio` resource manager must be running (`pidin | grep rpi_gpio` to verify — pid should be present)
 - `llama-cli` and the model file must be present at the paths defined by `LLAMA_CLI_PATH` and `LLAMA_MODEL_PATH`
 - UDP ports 8080–8082 must be available
 - Minimum 1.5 GB free RAM recommended (model runtime + node state + OS overhead)
@@ -192,6 +220,10 @@ Required QNX libraries: `libm`, `libsocket`. No third-party dependencies. The `l
 ## Sample Output
 
 ```
+[GPIO] Init: BCM17 → output HIGH (motor released)
+[GPIO] Init: BCM18 → output HIGH (motor released)
+[GPIO] Init: BCM27 → output HIGH (motor released)
+
 [Main] ══ System online ══
   Core 0  → sensor listeners    prio 17-19  (SCHED_FIFO)
   Core 1  → motor controllers   prio 21     (SCHED_FIFO)
@@ -206,7 +238,7 @@ Required QNX libraries: `libm`, `libsocket`. No third-party dependencies. The `l
 
 [Node 2] All-zero packet — node is OFF. Skipping thresholds / FFT / heartbeat.
 [Watchdog] Node 2 STALE heartbeat seq=47 — Core 0 may be starved. GPIO fail-safe.
-[GPIO] Node 2 BCM18 reset pulse complete.
+[GPIO] Node 2 BCM18 — reset pulse complete.
 
 ╔══════════════════════════════════════════════════╗
 ║  TinyLLaMA Health Report                         ║
