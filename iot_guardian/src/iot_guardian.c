@@ -53,7 +53,6 @@
 #include <signal.h>
 #include <time.h>
 #include <sys/mman.h>
-#include <signal.h>
 
 /* Networking */
 #include <sys/socket.h>
@@ -68,9 +67,7 @@
 #include <sched.h>
 #include <sys/wait.h>
 
-/* GPIO MMIO */
-#include <devctl.h>
-#include <hw/inout.h>
+/* GPIO via QNX /dev/gpio/N resource manager — no MMIO headers needed */
 
 /* ═══════════════════════════════════════════════════════════════════════════
  * Constants
@@ -115,17 +112,32 @@
 #define WATCHDOG_MS         100
 
 /* AI manager */
-#define AI_INTERVAL_S       10
+#define AI_INTERVAL_S       30
 #define AI_BUDGET_NS        7000000LL   /* 7 ms budget                */
 #define AI_PERIOD_NS        10000000LL  /* per 10 ms → 70% cap        */
-#define LLAMA_CLI_PATH      "/tmp/ai_engine/llama-cli"
-#define LLAMA_MODEL_PATH    "/tmp/ai_engine/tinyllama-1.1b-chat-v1.0-q4_k_m.gguf"
+#define LLAMA_CLI_PATH      "/usr/local/bin/llama-cli"
+#define LLAMA_MODEL_PATH    "/data/models/tinyllama-1.1b-chat-v1.0-q4_k_m.gguf"
 
-/* GPIO — BCM2712 (RPi5 RP1 peripheral base) */
-#define GPIO_BASE_PHYS      0x1F00200000ULL
-#define GPIO_SIZE           0x1000
-#define GPSET0_OFF          0x1C
-#define GPCLR0_OFF          0x28
+/* ═══════════════════════════════════════════════════════════════════════════
+ * GPIO — rpi_gpio resource manager  (/dev/gpio/N)
+ *
+ * Confirmed interface from strings /system/bin/rpi_gpio:
+ *
+ *   write "out"   — configure pin as output      (no newline — echo -n)
+ *   write "in"    — configure pin as input
+ *   write "on"    — drive HIGH                   (NOT "1")
+ *   write "off"   — drive LOW                    (NOT "0")
+ *   read          — returns current pin value
+ *
+ * "1"/"0" and newline-terminated strings are silently ignored by rpi_gpio.
+ * That is why every previous attempt failed despite open() succeeding.
+ *
+ * Startup sequence (called once from main before any thread starts):
+ *   gpio_init_all_high() — drives all three motor reset pins HIGH so
+ *   motors are NOT in reset at boot. Without this the pins are floating
+ *   and the motors may be stuck in reset from power-on.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+#define GPIO_DEV_FMT        "/dev/gpio/%d"
 static const int MOTOR_GPIO_PINS[NUM_NODES] = {17, 18, 27};
 
 /* ═══════════════════════════════════════════════════════════════════════════
@@ -188,10 +200,7 @@ typedef struct {
     NodeState *nodes;
     int        ai_chid;
 } AIManagerArg;
-void clean_exit_handler(int sig) {
-    fprintf(stderr, "\n[Main] Caught signal %d. Exiting cleanly to save gmon.out...\n", sig);
-    exit(0);
-}
+
 /* ═══════════════════════════════════════════════════════════════════════════
  * FFT — Cooley-Tukey Radix-2 in-place
  * ═══════════════════════════════════════════════════════════════════════════ */
@@ -223,27 +232,93 @@ static void compute_fft(complex_t *x, int N) {
 }
 
 /* ═══════════════════════════════════════════════════════════════════════════
- * GPIO motor reset  (Core 1, called with IO_PRIV)
+ * gpio_fd_write — write a command string to an open /dev/gpio/N fd.
+ * NO newline — rpi_gpio uses echo -n semantics, not line-buffered.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static int gpio_fd_write(int fd, const char *cmd) {
+    ssize_t n = write(fd, cmd, strlen(cmd));
+    if (n < 0) {
+        perror("[GPIO] write");
+        return -1;
+    }
+    return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * gpio_pin_set — open a pin fd, write one command, close.
+ * Used for single-shot operations (init, direction set).
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static int gpio_pin_set(int pin, const char *cmd) {
+    char path[32];
+    snprintf(path, sizeof(path), GPIO_DEV_FMT, pin);
+    int fd = open(path, O_RDWR);
+    if (fd < 0) {
+        fprintf(stderr, "[GPIO] open(%s): %s\n", path, strerror(errno));
+        return -1;
+    }
+    int rc = gpio_fd_write(fd, cmd);
+    close(fd);
+    return rc;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * gpio_init_all_high — called ONCE from main() before any thread starts.
  *
- * Uses nanospin_ns() — busy-waits on a dedicated core so hold time is
- * deterministic.  Do NOT use delay() here; that yields the thread.
+ * Configures all three motor reset pins as OUTPUT and drives them HIGH.
+ * This releases the motors from reset at boot — without this the pins
+ * are floating and motors may be stuck in reset from power-on.
+ * ═══════════════════════════════════════════════════════════════════════════ */
+static void gpio_init_all_high(void) {
+    for (int i = 0; i < NUM_NODES; i++) {
+        int pin = MOTOR_GPIO_PINS[i];
+        if (gpio_pin_set(pin, "out") < 0) {
+            fprintf(stderr, "[GPIO] Init: failed to set pin %d as output\n", pin);
+            continue;
+        }
+        if (gpio_pin_set(pin, "on") < 0) {
+            fprintf(stderr, "[GPIO] Init: failed to drive pin %d HIGH\n", pin);
+            continue;
+        }
+        fprintf(stderr, "[GPIO] Init: BCM%d → output HIGH (motor released)\n", pin);
+    }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+ * motor_gpio_reset — active-low 50ms reset pulse via /dev/gpio/N
+ *
+ * rpi_gpio command reference (confirmed from binary strings):
+ *   "out" — set direction output   (no newline)
+ *   "off" — drive LOW              (NOT "0", NOT "0\n")
+ *   "on"  — drive HIGH             (NOT "1", NOT "1\n")
+ *
+ * Sequence:
+ *   1. open /dev/gpio/<pin>
+ *   2. write "out"   — ensure output direction
+ *   3. write "off"   — assert LOW  (motor enters reset)
+ *   4. delay(50)     — hold 50 ms
+ *   5. write "on"    — release HIGH (motor reinitialises)
+ *   6. close fd
  * ═══════════════════════════════════════════════════════════════════════════ */
 static void motor_gpio_reset(int node_id) {
-    int pin = MOTOR_GPIO_PINS[node_id - 1];
+    int  pin = MOTOR_GPIO_PINS[node_id - 1];
+    char path[32];
+    snprintf(path, sizeof(path), GPIO_DEV_FMT, pin);
 
-    uintptr_t base = mmap_device_io(GPIO_SIZE, GPIO_BASE_PHYS);
-    if (base == MAP_DEVICE_FAILED) {
-        perror("[GPIO] mmap_device_io"); return;
+    int fd = open(path, O_RDWR);
+    if (fd < 0) {
+        fprintf(stderr, "[GPIO] Node %d open(%s): %s\n",
+                node_id, path, strerror(errno));
+        return;
     }
 
-    uint32_t mask = (1u << pin);
-    out32(base + GPCLR0_OFF, mask);     /* assert LOW  (active-low reset) */
-   // nanospin_ns(50000000);              /* hold 50 ms — busy spin         */
-   // out32(base + GPSET0_OFF, mask);     /* de-assert HIGH                 */
+    gpio_fd_write(fd, "out");   /* ensure output direction               */
+    gpio_fd_write(fd, "off");   /* assert LOW  — motor enters reset      */
+    delay(50);                  /* hold 50 ms                            */
+    gpio_fd_write(fd, "on");    /* release HIGH — motor reinitialises    */
 
-    munmap_device_io(base, GPIO_SIZE);
+    close(fd);
 
-    fprintf(stderr, "[GPIO] Node %d BCM%d reset pulse complete.\n",
+    fprintf(stderr, "[GPIO] Node %d BCM%d — reset pulse complete.\n",
             node_id, pin);
 }
 
@@ -272,9 +347,7 @@ static void *motor_ctrl_thread(void *arg) {
     ThreadCtl(_NTO_TCTL_RUNMASK_GET_AND_SET_INHERIT,
               (void *)(uintptr_t)CORE1_MASK);
 
-    /* ── I/O privilege for MMIO GPIO ────────────────────────────────────── */
-    if (ThreadCtl(_NTO_TCTL_IO_PRIV, 0) == -1)
-        perror("[MotorCtrl] IO_PRIV — GPIO resets will fail");
+    /* Note: _NTO_TCTL_IO_PRIV not needed — GPIO via /dev/gpio/N fd, not MMIO */
 
     /* ── Watchdog timer: PULSE_WATCHDOG_TICK every WATCHDOG_MS ─────────── */
     struct sigevent wdog_ev;
@@ -375,27 +448,7 @@ static void process_node_data(NodeState *ns, const char *buf) {
                &temp1, &x1, &y1, &z1,
                &temp2, &x2, &y2, &z2) != 8)
         return;
-    int node_off = (temp1 == 0.0 && temp2 == 0.0 &&
-                        x1 == 0.0 && y1 == 0.0 && z1 == 0.0 &&
-                        x2 == 0.0 && y2 == 0.0 && z2 == 0.0);
-        if (node_off) {
-            fprintf(stderr,
-                "[Node %d] All-zero packet — node is OFF. "
-                "Skipping thresholds / FFT / heartbeat.\n",
-                ns->node_id);
-            /* Mark snapshot slot as offline so AI prompt labels it correctly */
-            if (pthread_mutex_trylock(&g_snapshot_mutex) == 0) {
-                int idx = ns->node_id - 1;
-                memset(&g_snapshot.temp1[idx],    0, sizeof(double));
-                memset(&g_snapshot.temp2[idx],    0, sizeof(double));
-                memset(&g_snapshot.rms1[idx],     0, sizeof(double));
-                memset(&g_snapshot.rms2[idx],     0, sizeof(double));
-                memset(&g_snapshot.fft_peak[idx], 0, sizeof(double));
-                /* Do NOT touch snapshot_time — other nodes may be live */
-                pthread_mutex_unlock(&g_snapshot_mutex);
-            }
-            return;   /* <── skip everything below */
-        }
+
     double rms1 = sqrt(x1*x1 + y1*y1 + z1*z1);
     double rms2 = sqrt(x2*x2 + y2*y2 + z2*z2);
 
@@ -530,12 +583,12 @@ static void build_llama_prompt(char *out, size_t sz,
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", tm_info);
 
     snprintf(out, sz,
-    		"<|system|>\n"
-    		"You are a predictive maintenance AI on an RTOS. "
-    		"Analyze the snapshot and output a concise report. "
-    		"Correlate temperature and FFT peaks to state a specific mechanical fault hypothesis (bearing wear, misalignment, friction). "
-    		 //"Be direct — no preamble, no markdown.\n"
-    	"<|user|>\n"
+        "<|system|>\n"
+        "You are an embedded RTOS health monitor on a Raspberry Pi 5. "
+        "Analyse the sensor snapshot and give a concise 3-5 sentence status "
+        "report. Flag nodes at risk. Note any abnormal restart counts. "
+        "Be direct — no preamble, no markdown.\n"
+        "<|user|>\n"
         "Sensor snapshot at %s:\n"
         "Node1: T1=%.1fC T2=%.1fC RMS1=%.3f RMS2=%.3f "
             "FFT_peak=%.3f motor_restarts=%d\n"
@@ -638,7 +691,7 @@ static void run_llama_inference(const char *prompt) {
     close(pout[0]);
     waitpid(pid, NULL, 0);
 
-    fprintf(stderr,
+    fprintf(stdout,
         "\n╔══════════════════════════════════════════════════╗\n"
         "║  TinyLLaMA 30s Health Report                     ║\n"
         "╠══════════════════════════════════════════════════╣\n"
@@ -695,10 +748,10 @@ static void *ai_manager_thread(void *arg) {
         memcpy(&snap, &g_snapshot, sizeof(snap));
         pthread_mutex_unlock(&g_snapshot_mutex);
 
-     //   if (snap.snapshot_time == 0) {
-        //  fprintf(stderr, "[AI Manager] no sensor data yet — skipping\n");
-        //  continue;
-      //  }
+        if (snap.snapshot_time == 0) {
+            fprintf(stderr, "[AI Manager] no sensor data yet — skipping\n");
+            continue;
+        }
 
         char prompt[1200];
         build_llama_prompt(prompt, sizeof(prompt), &snap);
@@ -731,11 +784,6 @@ static int create_rt_thread(pthread_t *tid,
  * ═══════════════════════════════════════════════════════════════════════════ */
 int main(void) {
     /* Elevate main, pin to Core 0 */
-
-	    /* Catch Ctrl+C to ensure gmon.out is written */
-	    signal(SIGINT, clean_exit_handler);
-
-	    // ... rest of your main function ...
     struct sched_param sp = { .sched_priority = PRIO_MAIN };
     pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp);
     ThreadCtl(_NTO_TCTL_RUNMASK, (void *)(uintptr_t)CORE0_MASK);
@@ -746,6 +794,13 @@ int main(void) {
 
     memset(nodes,       0, sizeof(nodes));
     memset(&g_snapshot, 0, sizeof(g_snapshot));
+
+    /*
+     * Drive all motor reset pins HIGH before any thread starts.
+     * Motors are released from reset and run normally until a
+     * threshold triggers motor_gpio_reset() on a specific node.
+     */
+    gpio_init_all_high();
 
     /*
      * mlock — pin RT-critical data into physical pages.
